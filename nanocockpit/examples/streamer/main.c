@@ -133,7 +133,11 @@ static void main_task(void) {
     streamer_init(&streamer, &camera, &cpx);
     streamer_alloc_frames(&streamer, &camera);
 
+#ifndef STREAMER_JPEG
+    // With STREAMER_JPEG, the JPEG encoder already opened the cluster in streamer_alloc_frames
+    // (the PULP-OS cluster driver is not reference-counted, so it must not be opened twice)
     cluster_init(&cluster);
+#endif
 
     memory_dump(&cluster);
 

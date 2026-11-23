@@ -107,7 +107,7 @@
  **********************************************************************/
 
 // Frame resolution selection
-#define HIMAX_FORMAT               (2)
+#define HIMAX_FORMAT               (0)   // was 2 (HALF 162x162). FULL 324x324 -> 320x320 after crop, for crash_monitor
 
 // Clock mode selection
 //  - 0: MCLK mode [default]
@@ -187,6 +187,20 @@
 // #define CPX_SPI_BIDIRECTIONAL
 
 /************************* STREAMER SETTINGS **************************/
+
+// Send each frame JPEG-compressed (grayscale, encoded on the cluster) instead of raw.
+// The frame metadata is unchanged except frame_format = STREAMER_FORMAT_JPEG; the
+// client decodes it. Comment out to send raw frames again. (crash_monitor, 2026-11-23)
+#define STREAMER_JPEG
+
+// JPEG quality 1..100 (libjpeg scale). Measured on 150 flight frames with cars (320x320):
+// q50 6.4 KB/frame but YOLO-World kept only 97/129 car hits; q90 17.5 KB (~6x smaller
+// than raw) kept 126/129; q95 28 KB kept 128/129.
+#define STREAMER_JPEG_QUALITY       (90)
+
+// Print JPEG encode time and size every 128 frames on the JTAG console (make run).
+// Debug only: keep disabled in images that are flashed.
+// #define STREAMER_JPEG_STATS
 
 // Compute CRC32 checksum on transmitted buffers
 // #define STREAMER_SEND_CHECKSUM

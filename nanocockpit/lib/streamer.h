@@ -25,9 +25,15 @@
 #ifndef __STREAMER_H__
 #define __STREAMER_H__
 
+#include "config.h"
+#include "coroutine.h"
 #include "uart_protocol.h"
 
 #include <pmsis.h>
+
+#ifdef STREAMER_JPEG
+#include "gaplib/jpeg_encoder.h"
+#endif
 
 typedef enum {
     STREAMER_TYPE_IMAGE         = 0x01,
@@ -36,7 +42,9 @@ typedef enum {
 } __attribute__((packed)) streamer_type_e;
 
 typedef enum {
-    STREAMER_FORMAT_GRAY_8 = 0
+    STREAMER_FORMAT_GRAY_8 = 0,
+    // Complete JPEG file (SOI..EOI); frame_width/height/bpp describe the decoded image
+    STREAMER_FORMAT_JPEG   = 1
 } __attribute__((packed)) streamer_format_e;
 
 #define STREAMER_METADATA_VERSION 10
@@ -98,6 +106,8 @@ typedef struct streamer_s streamer_t;
 typedef struct streamer_frame_s {
     streamer_payload_t *payload;
     size_t payload_size;
+    // Bytes of image data after the metadata to transmit
+    size_t data_size;
 
     co_fn_ctx_t send_ctx;
     streamer_t *streamer;
@@ -135,6 +145,16 @@ typedef struct streamer_s {
 
     uint32_t reply_frame_timestamp;
     uint32_t reply_recv_timestamp;
+
+#ifdef STREAMER_JPEG
+    // Must stay in L2 (not FC L1): the cluster reads the encoder state and
+    // writes the encoded size into jpeg_done's task.
+    jpeg_encoder_t jpeg;
+    streamer_frame_t jpeg_frame;     // metadata + JPEG header + entropy data + footer
+    size_t jpeg_header_size;
+    co_event_t jpeg_done;
+    co_fn_ctx_t jpeg_ctx;
+#endif
 } streamer_t;
 
 void streamer_init(streamer_t *streamer, camera_t *camera, cpx_t *cpx);

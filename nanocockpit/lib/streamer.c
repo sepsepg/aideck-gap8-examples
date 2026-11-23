@@ -97,6 +97,13 @@ static streamer_packet_t *streamer_packet_init(cpx_send_req_t *cpx_req, streamer
 
 CO_FN_DECLARE(streamer_send_task);
 CO_FN_DECLARE(streamer_cpx_callback);
+#ifdef STREAMER_JPEG
+CO_FN_DECLARE(streamer_jpeg_task);
+
+// Upper bounds for the constant JPEG header and footer (actual: ~330 B and 2 B)
+#define STREAMER_JPEG_HEADER_MAX    (1024)
+#define STREAMER_JPEG_FOOTER_MAX    (16)
+#endif
 static void streamer_buffer_begin_received(streamer_t *streamer, streamer_packet_t *packet, uint16_t payload_length);
 static void streamer_buffer_data_received(streamer_t *streamer, streamer_packet_t *packet, uint16_t payload_length);
 
@@ -154,17 +161,65 @@ void streamer_alloc_frames(streamer_t *streamer, camera_t *camera) {
     }
 
     camera_init_frames_external(camera, CAMERA_BUFFERS, camera_buffers, buffer_size);
+
+#ifdef STREAMER_JPEG
+    // One output buffer, as large as a raw frame. The SDK's cluster encoder does not
+    // check the output size, so it must never be able to overflow: quality-50
+    // grayscale JPEG of camera images is ~0.5-2 bits/pixel, this allows 8.
+    size_t jpeg_payload_size = sizeof(streamer_payload_t) + STREAMER_JPEG_HEADER_MAX
+                             + CAMERA_CROP_WIDTH * CAMERA_CROP_HEIGHT + STREAMER_JPEG_FOOTER_MAX;
+    streamer_payload_t *jpeg_payload = pi_l2_malloc(jpeg_payload_size);
+
+    VERBOSE_PRINT(
+        "Streamer JPEG buffer:\t\t%s, %dB @ L2, %p\n",
+        jpeg_payload ? "OK" : "Failed",
+        jpeg_payload_size, jpeg_payload
+    );
+
+    if (jpeg_payload == NULL) {
+        CO_ASSERTION_FAILURE("Streamer JPEG buffer allocation failed.\n");
+    }
+
+    streamer->jpeg_frame.streamer = streamer;
+    streamer->jpeg_frame.payload = jpeg_payload;
+    streamer->jpeg_frame.payload_size = jpeg_payload_size;
+    streamer->jpeg_frame.data_size = 0;
+
+    struct jpeg_encoder_conf jpeg_conf;
+    jpeg_encoder_conf_init(&jpeg_conf);
+    jpeg_conf.width = CAMERA_CROP_WIDTH;
+    jpeg_conf.height = CAMERA_CROP_HEIGHT;
+    jpeg_conf.flags = JPEG_ENCODER_FLAGS_CLUSTER_OFFLOAD;
+
+    // jpeg_encoder_start opens (powers on) the cluster and loads the tables in its L1
+    if (jpeg_encoder_open(&streamer->jpeg, &jpeg_conf) || jpeg_encoder_start(&streamer->jpeg)) {
+        CO_ASSERTION_FAILURE("Streamer JPEG encoder init failed.\n");
+    }
+
+    // The JPEG header (tables, image size) is the same for every frame: write it once
+    // right after the metadata, the entropy data of each frame goes after it.
+    pi_buffer_t header;
+    uint32_t header_size = 0;
+    pi_buffer_init(&header, PI_BUFFER_TYPE_L2, jpeg_payload->buffer);
+    header.size = STREAMER_JPEG_HEADER_MAX;
+    if (jpeg_encoder_header_rst(&streamer->jpeg, &header, &header_size)
+            || header_size == 0 || header_size > STREAMER_JPEG_HEADER_MAX) {
+        CO_ASSERTION_FAILURE("Streamer JPEG header size %d invalid.\n", header_size);
+    }
+    streamer->jpeg_header_size = header_size;
+
+    VERBOSE_PRINT("Streamer JPEG init:\t\tOK, %dx%d, q%d, %d restart segments, header %dB\n",
+                  CAMERA_CROP_WIDTH, CAMERA_CROP_HEIGHT, STREAMER_JPEG_QUALITY,
+                  JPEG_RST_SEGMENTS, header_size);
+#endif
 }
 
 static size_t streamer_frame_get_size(streamer_frame_t *frame) {
-    // Note: this function returns the size of the frame to be transmitted, 
+    // Note: this function returns the size of the frame to be transmitted,
     // while frame->payload_size represents the capacity of the buffer.
     // The difference is due to acquiring camera images at a certain resolution
-    // and then cropping.
-    size_t frame_height = frame->payload->metadata.frame_height;
-    size_t frame_width = frame->payload->metadata.frame_width;
-    size_t frame_bpp = frame->payload->metadata.frame_bpp;
-    return sizeof(streamer_payload_t) + frame_height * frame_width * frame_bpp;
+    // and then cropping (raw), or to the variable size of JPEG frames.
+    return sizeof(streamer_payload_t) + frame->data_size;
 }
 
 static uint32_t streamer_compute_checksum(const void* buffer, size_t size) {
@@ -220,9 +275,100 @@ void streamer_send_frame_async(
 
         .inference = *inference
     };
+    frame->data_size = CAMERA_CROP_HEIGHT * CAMERA_CROP_WIDTH * CAMERA_CROP_BPP;
 
+#ifdef STREAMER_JPEG
+    co_fn_push_start(&streamer->jpeg_ctx, streamer_jpeg_task, (void *)frame, done_task);
+#else
     co_fn_push_start(&frame->send_ctx, streamer_send_task, (void *)frame, done_task);
+#endif
 }
+
+#ifdef STREAMER_JPEG
+// Encode the (cropped) camera frame to JPEG on the cluster, then send it. The camera
+// frame's buffer is only read during the encoding; the caller still waits for done_task
+// (end of the transmission) before handing the buffer back to the camera.
+// Frames whose JPEG would not fit the output buffer are skipped (counted in the stats).
+CO_FN_BEGIN(streamer_jpeg_task, streamer_frame_t *, frame)
+{
+#ifdef STREAMER_JPEG_STATS
+    static uint32_t stat_t0, stat_frames, stat_skipped, stat_bytes, stat_enc_us, stat_enc_max;
+#endif
+    static uint32_t t_enc;
+    static int32_t status;
+    // Only one frame at a time is encoded and sent, so static variables can be used.
+    // Static (L2) storage also keeps them readable by the cluster.
+    static streamer_t *streamer;
+    static streamer_frame_t *jpeg_frame;
+    static pi_buffer_t image;
+    static pi_buffer_t bitstream;
+    static pi_buffer_t footer;
+    static uint32_t body_size;
+    static uint32_t footer_size;
+    static uint8_t *data;
+
+    streamer = frame->streamer;
+    jpeg_frame = &streamer->jpeg_frame;
+    data = jpeg_frame->payload->buffer;
+
+    trace_set(TRACE_STREAMER_SEND, true);
+
+    pi_buffer_init(&image, PI_BUFFER_TYPE_L2, frame->payload->buffer);
+    image.size = CAMERA_CROP_WIDTH * CAMERA_CROP_HEIGHT;
+    image.width = CAMERA_CROP_WIDTH;
+    image.height = CAMERA_CROP_HEIGHT;
+
+    pi_buffer_init(&bitstream, PI_BUFFER_TYPE_L2, data + streamer->jpeg_header_size);
+    bitstream.size = CAMERA_CROP_WIDTH * CAMERA_CROP_HEIGHT;
+
+    t_enc = time_get_us();
+    jpeg_encoder_process_rst_async(&streamer->jpeg, &image, &bitstream, co_event_init(&streamer->jpeg_done));
+    CO_WAIT(&streamer->jpeg_done);
+    t_enc = time_get_us() - t_enc;
+
+    body_size = 0;
+    status = jpeg_encoder_process_rst_status(&body_size);
+
+#ifdef STREAMER_JPEG_STATS
+    // Printed over the JTAG console only: never enable it in a flashed image (with no debugger
+    // attached, the console output can block)
+    stat_frames++;
+    stat_enc_us += t_enc;
+    if (t_enc > stat_enc_max) stat_enc_max = t_enc;
+    if (status) stat_skipped++; else stat_bytes += body_size;
+    if (stat_t0 == 0) stat_t0 = time_get_us();
+    if (stat_frames == 128) {
+        uint32_t dt = time_get_us() - stat_t0;
+        VERBOSE_PRINT("JPEG: %d frames in %d ms, encode avg %d us max %d us, avg %d B, skipped %d\n",
+                      stat_frames, dt / 1000, stat_enc_us / stat_frames, stat_enc_max,
+                      stat_bytes / MAX(1, stat_frames - stat_skipped), stat_skipped);
+        stat_t0 = time_get_us();
+        stat_frames = stat_skipped = stat_bytes = stat_enc_us = stat_enc_max = 0;
+    }
+#endif
+
+    if (status) {
+        // Too much detail for the output buffer (should not happen with camera images): skip
+        trace_set(TRACE_STREAMER_SEND, false);
+        break;
+    }
+
+    pi_buffer_init(&footer, PI_BUFFER_TYPE_L2, data + streamer->jpeg_header_size + body_size);
+    footer.size = STREAMER_JPEG_FOOTER_MAX;
+    footer_size = 0;
+    jpeg_encoder_footer(&streamer->jpeg, &footer, &footer_size);
+
+    jpeg_frame->payload->metadata = frame->payload->metadata;
+    jpeg_frame->payload->metadata.frame_format = STREAMER_FORMAT_JPEG;
+    jpeg_frame->data_size = streamer->jpeg_header_size + body_size + footer_size;
+
+    trace_set(TRACE_STREAMER_SEND, false);
+
+    co_fn_push_start(&jpeg_frame->send_ctx, streamer_send_task, (void *)jpeg_frame, co_event_init(&streamer->jpeg_done));
+    CO_WAIT(&streamer->jpeg_done);
+}
+CO_FN_END()
+#endif
 
 CO_FN_BEGIN(streamer_send_task, streamer_frame_t *, frame)
 {

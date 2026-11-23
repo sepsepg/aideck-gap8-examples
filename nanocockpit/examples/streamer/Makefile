@@ -32,4 +32,9 @@ APP_SRCS += ../../lib/camera.c ../../lib/camera/himax.c ../../lib/cluster.c ../.
 APP_SRCS += ../../lib/cpx/cpx.c ../../lib/cpx/cpx_spi.c
 APP_SRCS += ../../lib/uart.c ../../lib/uart_protocol.c
 
+# JPEG encoder (used when config.h defines STREAMER_JPEG): a copy of the GAP SDK's gap_lib/jpeg
+# in ../../lib/jpeg with a configurable quality (STREAMER_JPEG_QUALITY) and rounded quantization
+APP_SRCS    += ../../lib/jpeg/jpeg_encoder.c ../../lib/jpeg/jpeg_constants.c ../../lib/jpeg/dct.c ../../lib/jpeg/cluster.c
+APP_CFLAGS  += -I$(CURDIR)/../../lib/jpeg/include -I$(CURDIR)/../../lib/jpeg
+
 include $(RULES_DIR)/pmsis_rules.mk
