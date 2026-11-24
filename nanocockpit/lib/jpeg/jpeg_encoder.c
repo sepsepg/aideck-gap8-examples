@@ -302,7 +302,12 @@ void gray_to_y(int r, int *y)
     *y = FLOAT2FIX(1.0f) * r - (128 << FIXQ);
     *y >>= FIXQ - 2;
   #else
-    *y = (r - 128) << 2;
+    // Scaled by 2, not 4 as in the GAP SDK: Dct8x8 keeps its intermediates in 16 bits, and
+    // its worst-case 2D gain is ~101 (1D gain 10.05 squared). With x4 (+-512) an 8x8 block
+    // with a sharp edge (white tape on a dark floor) reached ~41000 and wrapped around,
+    // decoding as a garbage block; x2 peaks at ~25900. Dct8x8 shifts by Q11+1 to match.
+    // (crash_monitor, 2026-11-23)
+    *y = (r - 128) << 1;
   #endif
 }
 

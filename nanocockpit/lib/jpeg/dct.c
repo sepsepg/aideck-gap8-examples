@@ -133,7 +133,8 @@ void Dct8x8(short int *__restrict__ data, const short int *__restrict__ ftab)
         dataptr++;  /* advance pointer to next column */
     }
 
-    for (ctr = 0; ctr < 64; ctr++) data[ctr]  = __builtin_pulp_mulfsN(data[ctr], ftab[ctr], Q11 + 2);
+    // Q11 + 1: the input samples are scaled by 2 (gray_to_y), see there why not 4
+    for (ctr = 0; ctr < 64; ctr++) data[ctr]  = __builtin_pulp_mulfsN(data[ctr], ftab[ctr], Q11 + 1);
 }
 
 #else
