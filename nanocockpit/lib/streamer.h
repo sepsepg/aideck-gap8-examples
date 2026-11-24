@@ -31,8 +31,15 @@
 
 #include <pmsis.h>
 
+#include <stdbool.h>
+
 #ifdef STREAMER_JPEG
 #include "gaplib/jpeg_encoder.h"
+
+#define STREAMER_JPEG_BUFFERS       (2)
+#ifndef STREAMER_JPEG_BUFFER_SIZE
+#define STREAMER_JPEG_BUFFER_SIZE   (56 * 1024)
+#endif
 #endif
 
 typedef enum {
@@ -150,7 +157,12 @@ typedef struct streamer_s {
     // Must stay in L2 (not FC L1): the cluster reads the encoder state and
     // writes the encoded size into jpeg_done's task.
     jpeg_encoder_t jpeg;
-    streamer_frame_t jpeg_frame;     // metadata + JPEG header + entropy data + footer
+    // metadata + JPEG header + entropy data + footer. Double-buffered: frame k+1 is encoded
+    // into one while frame k is sent from the other.
+    streamer_frame_t jpeg_frames[STREAMER_JPEG_BUFFERS];
+    int jpeg_next;                   // buffer the next frame is encoded into
+    bool jpeg_send_started;          // jpeg_sent was initialized by a first transmission
+    co_event_t jpeg_sent;            // end of the latest JPEG transmission
     size_t jpeg_header_size;
     co_event_t jpeg_done;
     co_fn_ctx_t jpeg_ctx;

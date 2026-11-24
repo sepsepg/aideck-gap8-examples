@@ -125,61 +125,89 @@ void camera_start(camera_t *camera) {
     co_fn_push_start(&camera->camera_ctx, camera_task, (void *)camera, NULL);
 }
 
+// The Himax streams continuously; a capture only records the next frame that starts after
+// it is armed. So the next capture is armed as soon as the current frame is complete, before
+// cropping it: arming it after the crop (which at full resolution takes longer than the
+// ~4 ms vertical blanking) missed every other frame. (crash_monitor, 2026-11-23)
 CO_FN_BEGIN(camera_task, camera_t *, camera)
 {
-    static int capture_idx, crop_idx, consume_idx;
+    static int idx;
     static frame_t *frame;
-
-    capture_idx = 0;
-    crop_idx = 0;
-    consume_idx = 0;
-
-    while (true) {
-        {
-            frame = &camera->frames[capture_idx % CAMERA_BUFFERS];
-
-            if (capture_idx >= CAMERA_BUFFERS) {
-                CO_WAIT(&frame->done_event);
-            }
-
-            himax_capture_async(&camera->himax, frame, co_event_init(&frame->done_event));
-            himax_start(&camera->himax);
-            trace_set((capture_idx % CAMERA_BUFFERS == 0) ? TRACE_CAMERA_BUF_0 : TRACE_CAMERA_BUF_1, true);
-
-            capture_idx += 1;
-        }
-
-        {
-            frame = &camera->frames[crop_idx % CAMERA_BUFFERS];
-
-            CO_WAIT(&frame->done_event);
-
-            trace_set((crop_idx % CAMERA_BUFFERS == 0) ? TRACE_CAMERA_BUF_0 : TRACE_CAMERA_BUF_1, false);
-            himax_stop(&camera->himax);
-            frame->frame_id = himax_get_frame_count(&camera->himax);
-            frame->frame_timestamp = time_get_us();
-
-#ifdef HIMAX_CONFIG_DUMP_ONCE
-            if (crop_idx == 0) {
-                VERBOSE_PRINT("HIMAX config after first frame\n");
-                himax_dump_config(&camera->himax);
-            }
+    static frame_t *next;
+#ifdef CAMERA_STATS
+    // JTAG console only. Per frame [us]: t1 frame ready -> frame count read, t2 -> next
+    // buffer free, t3 -> next capture armed, t4 crop, t5 crop done -> consumer done (next loop)
+    static uint32_t ts[6], sum[6], mx[6], n, lost;
+    static uint8_t last_id;
 #endif
 
-            camera_crop_frame_async(camera, frame, co_event_init(&frame->done_event));
+    frame = &camera->frames[0];
+    himax_capture_async(&camera->himax, frame, co_event_init(&frame->done_event));
+    himax_start(&camera->himax);
+    trace_set(TRACE_CAMERA_BUF_0, true);
 
-            crop_idx += 1;
+    for (idx = 0; true; idx++) {
+        // Capture idx complete
+        frame = &camera->frames[idx % CAMERA_BUFFERS];
+        CO_WAIT(&frame->done_event);
+
+        trace_set((idx % CAMERA_BUFFERS == 0) ? TRACE_CAMERA_BUF_0 : TRACE_CAMERA_BUF_1, false);
+#ifdef CAMERA_STATS
+        ts[0] = time_get_us();
+#endif
+        himax_stop(&camera->himax);
+        frame->frame_id = himax_get_frame_count(&camera->himax);
+        frame->frame_timestamp = time_get_us();
+#ifdef CAMERA_STATS
+        ts[1] = time_get_us();
+        if (idx > 0) lost += (uint8_t)(frame->frame_id - last_id - 1);
+        last_id = frame->frame_id;
+#endif
+
+#ifdef HIMAX_CONFIG_DUMP_ONCE
+        if (idx == 0) {
+            VERBOSE_PRINT("HIMAX config after first frame\n");
+            himax_dump_config(&camera->himax);
         }
+#endif
 
+        // Arm capture idx+1 into the next buffer, once its previous frame was consumed
+        next = &camera->frames[(idx + 1) % CAMERA_BUFFERS];
+        if (idx + 1 >= CAMERA_BUFFERS) {
+            CO_WAIT(&next->done_event);
+        }
+#ifdef CAMERA_STATS
+        ts[2] = time_get_us();
+#endif
+        himax_capture_async(&camera->himax, next, co_event_init(&next->done_event));
+        himax_start(&camera->himax);
+        trace_set(((idx + 1) % CAMERA_BUFFERS == 0) ? TRACE_CAMERA_BUF_0 : TRACE_CAMERA_BUF_1, true);
+#ifdef CAMERA_STATS
+        ts[3] = time_get_us();
+#endif
+
+        // Crop and hand frame idx to the consumer while idx+1 is being captured
+        camera_crop_frame_async(camera, frame, co_event_init(&frame->done_event));
+        CO_WAIT(&frame->done_event);
+#ifdef CAMERA_STATS
+        ts[4] = time_get_us();
         {
-            frame = &camera->frames[consume_idx % CAMERA_BUFFERS];
-
-            CO_WAIT(&frame->done_event);
-
-            camera_consume_frame_async(camera, frame, co_event_init(&frame->done_event));
-
-            consume_idx += 1;
+            uint32_t d[5] = { ts[1] - ts[0], ts[2] - ts[1], ts[3] - ts[2], ts[4] - ts[3], 0 };
+            for (int j = 0; j < 4; j++) {
+                sum[j] += d[j];
+                if (d[j] > mx[j]) mx[j] = d[j];
+            }
+            if (++n == 128) {
+                VERBOSE_PRINT("CAM: avg/max us: id-read %d/%d, wait-buf %d/%d, arm %d/%d, crop %d/%d; "
+                              "camera frames lost %d\n",
+                              sum[0] / n, mx[0], sum[1] / n, mx[1], sum[2] / n, mx[2], sum[3] / n, mx[3], lost);
+                for (int j = 0; j < 6; j++) sum[j] = mx[j] = 0;
+                n = lost = 0;
+            }
         }
+#endif
+
+        camera_consume_frame_async(camera, frame, co_event_init(&frame->done_event));
     }
 }
 CO_FN_END()
@@ -188,7 +216,10 @@ static void camera_crop_frame_async(camera_t *camera, frame_t *frame, pi_task_t 
     co_fn_push_start(&frame->consumer_ctx, camera_crop_task, (void *)frame, done_task);
 }
 
-#define CAMERA_CROP_YIELD 1
+// Yield every this many rows. Was 1: at 320x320, 320 yields per frame made the crop take
+// most of a frame period (each yield waits behind the other queued tasks), which delayed
+// the encode and the next capture. 32 rows (~10 KB of memmove) still yield every ~0.1 ms.
+#define CAMERA_CROP_YIELD 32
 
 CO_FN_BEGIN(camera_crop_task, frame_t *, frame)
 {
@@ -199,6 +230,11 @@ CO_FN_BEGIN(camera_crop_task, frame_t *, frame)
     // TODO: return immediately if data doesn't need to be moved in memory
     // * all(CAMERA_CROP_{TOP,LEFT,RIGHT} == 0), CAMERA_CROP_BOTTOM can be != 0
     // * all(CAMERA_CROP_{LEFT,RIGHT} == 0) can be handled by changing only the frame buffer pointer
+
+#ifdef CAMERA_HW_CROP
+    // Already cropped by the camera interface
+    break;
+#endif
 
     src_buffer = frame->buffer + CAMERA_CROP_TOP * CAMERA_CAPTURE_WIDTH;
     dst_buffer = frame->buffer;

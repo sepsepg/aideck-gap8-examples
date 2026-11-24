@@ -163,27 +163,32 @@ void streamer_alloc_frames(streamer_t *streamer, camera_t *camera) {
     camera_init_frames_external(camera, CAMERA_BUFFERS, camera_buffers, buffer_size);
 
 #ifdef STREAMER_JPEG
-    // One output buffer, as large as a raw frame. The SDK's cluster encoder does not
-    // check the output size, so it must never be able to overflow: quality-50
-    // grayscale JPEG of camera images is ~0.5-2 bits/pixel, this allows 8.
+    // Two output buffers: a frame is encoded into one while the previous frame is sent
+    // from the other. The encoder checks the output size of every restart segment and
+    // fails (the frame is skipped) instead of overflowing.
     size_t jpeg_payload_size = sizeof(streamer_payload_t) + STREAMER_JPEG_HEADER_MAX
-                             + CAMERA_CROP_WIDTH * CAMERA_CROP_HEIGHT + STREAMER_JPEG_FOOTER_MAX;
-    streamer_payload_t *jpeg_payload = pi_l2_malloc(jpeg_payload_size);
+                             + STREAMER_JPEG_BUFFER_SIZE + STREAMER_JPEG_FOOTER_MAX;
 
-    VERBOSE_PRINT(
-        "Streamer JPEG buffer:\t\t%s, %dB @ L2, %p\n",
-        jpeg_payload ? "OK" : "Failed",
-        jpeg_payload_size, jpeg_payload
-    );
+    for (int i = 0; i < STREAMER_JPEG_BUFFERS; i++) {
+        streamer_payload_t *jpeg_payload = pi_l2_malloc(jpeg_payload_size);
 
-    if (jpeg_payload == NULL) {
-        CO_ASSERTION_FAILURE("Streamer JPEG buffer allocation failed.\n");
+        VERBOSE_PRINT(
+            "Streamer JPEG buffer #%d:\t%s, %dB @ L2, %p\n",
+            i, jpeg_payload ? "OK" : "Failed",
+            jpeg_payload_size, jpeg_payload
+        );
+
+        if (jpeg_payload == NULL) {
+            CO_ASSERTION_FAILURE("Streamer JPEG buffer allocation failed.\n");
+        }
+
+        streamer->jpeg_frames[i].streamer = streamer;
+        streamer->jpeg_frames[i].payload = jpeg_payload;
+        streamer->jpeg_frames[i].payload_size = jpeg_payload_size;
+        streamer->jpeg_frames[i].data_size = 0;
     }
-
-    streamer->jpeg_frame.streamer = streamer;
-    streamer->jpeg_frame.payload = jpeg_payload;
-    streamer->jpeg_frame.payload_size = jpeg_payload_size;
-    streamer->jpeg_frame.data_size = 0;
+    streamer->jpeg_next = 0;
+    streamer->jpeg_send_started = false;
 
     struct jpeg_encoder_conf jpeg_conf;
     jpeg_encoder_conf_init(&jpeg_conf);
@@ -196,15 +201,19 @@ void streamer_alloc_frames(streamer_t *streamer, camera_t *camera) {
         CO_ASSERTION_FAILURE("Streamer JPEG encoder init failed.\n");
     }
 
-    // The JPEG header (tables, image size) is the same for every frame: write it once
-    // right after the metadata, the entropy data of each frame goes after it.
+    // The JPEG header (tables, image size) is the same for every frame: write it once into
+    // each buffer right after the metadata, the entropy data of each frame goes after it.
     pi_buffer_t header;
     uint32_t header_size = 0;
-    pi_buffer_init(&header, PI_BUFFER_TYPE_L2, jpeg_payload->buffer);
+    pi_buffer_init(&header, PI_BUFFER_TYPE_L2, streamer->jpeg_frames[0].payload->buffer);
     header.size = STREAMER_JPEG_HEADER_MAX;
     if (jpeg_encoder_header_rst(&streamer->jpeg, &header, &header_size)
             || header_size == 0 || header_size > STREAMER_JPEG_HEADER_MAX) {
         CO_ASSERTION_FAILURE("Streamer JPEG header size %d invalid.\n", header_size);
+    }
+    for (int i = 1; i < STREAMER_JPEG_BUFFERS; i++) {
+        memcpy(streamer->jpeg_frames[i].payload->buffer, streamer->jpeg_frames[0].payload->buffer,
+               header_size);
     }
     streamer->jpeg_header_size = header_size;
 
@@ -285,19 +294,28 @@ void streamer_send_frame_async(
 }
 
 #ifdef STREAMER_JPEG
-// Encode the (cropped) camera frame to JPEG on the cluster, then send it. The camera
-// frame's buffer is only read during the encoding; the caller still waits for done_task
-// (end of the transmission) before handing the buffer back to the camera.
+// Encode the (cropped) camera frame to JPEG on the cluster into the next output buffer,
+// start its transmission and return: done_task fires as soon as the camera frame's buffer
+// is no longer needed, so the caller can encode the next frame while this one is sent.
+//
+// Transmissions stay one at a time and in order: before starting one, wait for the previous
+// one (it ran during this encode, so normally it has already finished; if Wi-Fi is slow,
+// this wait is what holds the camera back). With two output buffers this also guarantees
+// that the buffer being encoded into is not being sent: the only transmission that can
+// still be running is the previous frame's, from the other buffer.
+//
 // Frames whose JPEG would not fit the output buffer are skipped (counted in the stats).
 CO_FN_BEGIN(streamer_jpeg_task, streamer_frame_t *, frame)
 {
 #ifdef STREAMER_JPEG_STATS
     static uint32_t stat_t0, stat_frames, stat_skipped, stat_bytes, stat_enc_us, stat_enc_max;
+    static uint32_t stat_wait_us, stat_wait_max;
 #endif
-    static uint32_t t_enc;
+    static uint32_t t_enc, t_wait;
     static int32_t status;
-    // Only one frame at a time is encoded and sent, so static variables can be used.
-    // Static (L2) storage also keeps them readable by the cluster.
+    // Only one frame at a time is encoded (the caller waits for done_task before passing
+    // the next one), so static variables can be used. Static (L2) storage also keeps them
+    // readable by the cluster.
     static streamer_t *streamer;
     static streamer_frame_t *jpeg_frame;
     static pi_buffer_t image;
@@ -308,7 +326,7 @@ CO_FN_BEGIN(streamer_jpeg_task, streamer_frame_t *, frame)
     static uint8_t *data;
 
     streamer = frame->streamer;
-    jpeg_frame = &streamer->jpeg_frame;
+    jpeg_frame = &streamer->jpeg_frames[streamer->jpeg_next];
     data = jpeg_frame->payload->buffer;
 
     trace_set(TRACE_STREAMER_SEND, true);
@@ -319,7 +337,7 @@ CO_FN_BEGIN(streamer_jpeg_task, streamer_frame_t *, frame)
     image.height = CAMERA_CROP_HEIGHT;
 
     pi_buffer_init(&bitstream, PI_BUFFER_TYPE_L2, data + streamer->jpeg_header_size);
-    bitstream.size = CAMERA_CROP_WIDTH * CAMERA_CROP_HEIGHT;
+    bitstream.size = STREAMER_JPEG_BUFFER_SIZE;
 
     t_enc = time_get_us();
     jpeg_encoder_process_rst_async(&streamer->jpeg, &image, &bitstream, co_event_init(&streamer->jpeg_done));
@@ -329,27 +347,14 @@ CO_FN_BEGIN(streamer_jpeg_task, streamer_frame_t *, frame)
     body_size = 0;
     status = jpeg_encoder_process_rst_status(&body_size);
 
-#ifdef STREAMER_JPEG_STATS
-    // Printed over the JTAG console only: never enable it in a flashed image (with no debugger
-    // attached, the console output can block)
-    stat_frames++;
-    stat_enc_us += t_enc;
-    if (t_enc > stat_enc_max) stat_enc_max = t_enc;
-    if (status) stat_skipped++; else stat_bytes += body_size;
-    if (stat_t0 == 0) stat_t0 = time_get_us();
-    if (stat_frames == 128) {
-        uint32_t dt = time_get_us() - stat_t0;
-        VERBOSE_PRINT("JPEG: %d frames in %d ms, encode avg %d us max %d us, avg %d B, skipped %d\n",
-                      stat_frames, dt / 1000, stat_enc_us / stat_frames, stat_enc_max,
-                      stat_bytes / MAX(1, stat_frames - stat_skipped), stat_skipped);
-        stat_t0 = time_get_us();
-        stat_frames = stat_skipped = stat_bytes = stat_enc_us = stat_enc_max = 0;
-    }
-#endif
-
     if (status) {
-        // Too much detail for the output buffer (should not happen with camera images): skip
+        // A band had too much detail for its share of the output buffer: skip the frame
+        // (the buffer stays free for the next one)
         trace_set(TRACE_STREAMER_SEND, false);
+#ifdef STREAMER_JPEG_STATS
+        stat_skipped++;
+        stat_frames++;
+#endif
         break;
     }
 
@@ -364,8 +369,44 @@ CO_FN_BEGIN(streamer_jpeg_task, streamer_frame_t *, frame)
 
     trace_set(TRACE_STREAMER_SEND, false);
 
-    co_fn_push_start(&jpeg_frame->send_ctx, streamer_send_task, (void *)jpeg_frame, co_event_init(&streamer->jpeg_done));
-    CO_WAIT(&streamer->jpeg_done);
+    // One transmission at a time (streamer_send_task and the CPX request are shared)
+    t_wait = time_get_us();
+    if (streamer->jpeg_send_started) {
+        while (!co_event_is_done(&streamer->jpeg_sent)) {
+            CO_WAIT(&streamer->jpeg_sent);
+        }
+    }
+    t_wait = time_get_us() - t_wait;
+
+#ifdef STREAMER_JPEG_STATS
+    // Printed over the JTAG console only: never enable it in a flashed image (with no debugger
+    // attached, the console output can block)
+    stat_frames++;
+    stat_enc_us += t_enc;
+    if (t_enc > stat_enc_max) stat_enc_max = t_enc;
+    stat_wait_us += t_wait;
+    if (t_wait > stat_wait_max) stat_wait_max = t_wait;
+    stat_bytes += body_size;
+    if (stat_t0 == 0) stat_t0 = time_get_us();
+    if (stat_frames >= 128) {
+        uint32_t dt = time_get_us() - stat_t0;
+        VERBOSE_PRINT("JPEG: %d frames in %d ms, encode avg %d us max %d us, "
+                      "wait for previous send avg %d us max %d us, avg %d B, skipped %d\n",
+                      stat_frames, dt / 1000, stat_enc_us / stat_frames, stat_enc_max,
+                      stat_wait_us / stat_frames, stat_wait_max,
+                      stat_bytes / MAX(1, stat_frames - stat_skipped), stat_skipped);
+        stat_t0 = time_get_us();
+        stat_frames = stat_skipped = stat_bytes = stat_enc_us = stat_enc_max = 0;
+        stat_wait_us = stat_wait_max = 0;
+    }
+#endif
+
+    streamer->jpeg_send_started = true;
+    streamer->jpeg_next = (streamer->jpeg_next + 1) % STREAMER_JPEG_BUFFERS;
+    co_fn_push_start(&jpeg_frame->send_ctx, streamer_send_task, (void *)jpeg_frame,
+                     co_event_init(&streamer->jpeg_sent));
+
+    // Return without waiting for the transmission: the camera frame is no longer needed
 }
 CO_FN_END()
 #endif

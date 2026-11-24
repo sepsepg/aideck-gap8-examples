@@ -116,6 +116,15 @@ int32_t himax_init(himax_t *himax) {
 
     pi_himax_conf_init(&camera_conf);
 
+#ifdef CAMERA_HW_CROP
+    // Hardware crop: the CPI frame slicing keeps only this window (set when the camera opens)
+    camera_conf.roi.slice_en = 1;
+    camera_conf.roi.x = CAMERA_CROP_LEFT;
+    camera_conf.roi.y = CAMERA_CROP_TOP;
+    camera_conf.roi.w = CAMERA_CROP_WIDTH;
+    camera_conf.roi.h = CAMERA_CROP_HEIGHT;
+#endif
+
     pi_open_from_conf(&himax->camera, &camera_conf);
 
     status = pi_camera_open(&himax->camera);

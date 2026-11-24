@@ -177,6 +177,12 @@
 #define CAMERA_CROP_BOTTOM (1)
 #endif
 
+// Crop in hardware: the camera interface (CPI frame slicing) writes only the cropped window
+// into the buffer, instead of copying it afterwards on the FC. At 324x324 that copy took
+// 9.3 ms per frame, which with the 14.8 ms JPEG encode exceeded the 22.9 ms frame period and
+// lost one camera frame in three. (crash_monitor, 2026-11-23)
+#define CAMERA_HW_CROP
+
 /**************************** CPX SETTINGS ****************************/
 
 // Enable bidirectional CPX SPI communication (GAP<=>ESP32).
@@ -198,9 +204,16 @@
 // than raw) kept 126/129; q95 28 KB kept 128/129.
 #define STREAMER_JPEG_QUALITY       (90)
 
+// Capacity of each of the two JPEG output buffers (entropy-coded data). A frame is encoded
+// into one buffer while the previous frame is sent from the other. Each of the 8 restart
+// segments (40-row bands) gets 1/8 of it, and a frame with a band that does not fit is
+// skipped. q90 frames average ~17-23 KB, so a 7 KB slot leaves ~2.5x margin per band.
+#define STREAMER_JPEG_BUFFER_SIZE   (56 * 1024)
+
 // Print JPEG encode time and size every 128 frames on the JTAG console (make run).
 // Debug only: keep disabled in images that are flashed.
 // #define STREAMER_JPEG_STATS
+// #define CAMERA_STATS  // camera loop timing on the JTAG console (debug only, like the above)
 
 // Compute CRC32 checksum on transmitted buffers
 // #define STREAMER_SEND_CHECKSUM
@@ -279,12 +292,20 @@
 
 /************************** CAMERA SETTINGS ***************************/
 
+#ifdef CAMERA_HW_CROP
+// The CPI delivers the cropped window directly: capture size = crop size
+#define CAMERA_CROP_WIDTH      (HIMAX_WIDTH - CAMERA_CROP_LEFT - CAMERA_CROP_RIGHT)
+#define CAMERA_CROP_HEIGHT     (HIMAX_HEIGHT - CAMERA_CROP_TOP - CAMERA_CROP_BOTTOM)
+#define CAMERA_CAPTURE_WIDTH   (CAMERA_CROP_WIDTH)
+#define CAMERA_CAPTURE_HEIGHT  (CAMERA_CROP_HEIGHT)
+#else
 #define CAMERA_CAPTURE_WIDTH   (HIMAX_WIDTH)
 #define CAMERA_CAPTURE_HEIGHT  (HIMAX_HEIGHT - CAMERA_CROP_BOTTOM)
-#define CAMERA_CAPTURE_BPP     (HIMAX_BPP)
 
 #define CAMERA_CROP_WIDTH      (CAMERA_CAPTURE_WIDTH - CAMERA_CROP_LEFT - CAMERA_CROP_RIGHT)
 #define CAMERA_CROP_HEIGHT     (CAMERA_CAPTURE_HEIGHT - CAMERA_CROP_TOP)
+#endif
+#define CAMERA_CAPTURE_BPP     (HIMAX_BPP)
 #define CAMERA_CROP_BPP        (1)
 
 #endif // __CONFIG_H__

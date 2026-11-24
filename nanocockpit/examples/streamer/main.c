@@ -70,6 +70,8 @@ CO_FN_BEGIN(camera_callback, frame_t *, camera_frame)
 
     camera_started = true;
 
+    // streamer_tx_done: end of the transmission for raw frames; with STREAMER_JPEG, end of
+    // the encoding (the frame is still being sent while the next one is encoded)
     streamer_send_frame_async(
         &streamer,
         camera_frame,
